@@ -1,0 +1,9 @@
+services:
+  vt-scanner:
+    build: .
+    container_name: vt-scanner
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./VTAPIKEYS.txt:/app/VTAPIKEYS.txt:ro

@@ -1,13 +1,12 @@
-FROM python:3.12-slim
+FROM ghcr.io/d4vinci/scrapling:latest
 
 WORKDIR /app
 
-# Install dependencies
+ENV PYTHONUNBUFFERED=1
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
 COPY vt_scanner.py .
 
-# Run the scanner
-CMD ["python", "-u", "vt_scanner.py"]
+ENTRYPOINT ["python", "-u", "vt_scanner.py"]

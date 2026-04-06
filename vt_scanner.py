@@ -306,6 +306,7 @@ class VTScannerService:
         self.gsb_futures: dict[Future[Any], dict[str, Any]] = {}
         self.scrape_futures: dict[Future[Any], dict[str, Any]] = {}
         self.vt_request_stats = VTRequestStats(day=utcnow().date().isoformat())
+        self.vt_request_lock = threading.Lock()
 
         self.vt_key = VTKeyState.from_api_key(
             self.vt_api_key,
@@ -1781,30 +1782,31 @@ class VTScannerService:
         last_error: Exception | None = None
         max_attempts = 1 if path.startswith("/analyses/") else 3
         for attempt in range(max_attempts):
-            if not self.vt_disable_throttle:
-                self.vt_key.wait()
-            key = self.vt_key
             headers = dict(kwargs.pop("headers", {}))
-            headers["x-apikey"] = key.api_key
-            try:
-                response = self.session.request(
-                    method,
-                    f"{VT_BASE_URL}{path}",
-                    headers=headers,
-                    timeout=self.request_timeout,
-                    **kwargs,
-                )
-            except requests.RequestException as exc:
-                last_error = exc
-                sleep_for = min(2**attempt, 30)
-                logging.warning(
-                    "VirusTotal request failed with %s using key %s, retrying in %ss",
-                    exc,
-                    key.fingerprint,
-                    sleep_for,
-                )
-                time.sleep(sleep_for)
-                continue
+            with self.vt_request_lock:
+                if not self.vt_disable_throttle:
+                    self.vt_key.wait()
+                key = self.vt_key
+                headers["x-apikey"] = key.api_key
+                try:
+                    response = self.session.request(
+                        method,
+                        f"{VT_BASE_URL}{path}",
+                        headers=headers,
+                        timeout=self.request_timeout,
+                        **kwargs,
+                    )
+                except requests.RequestException as exc:
+                    last_error = exc
+                    sleep_for = min(2**attempt, 30)
+                    logging.warning(
+                        "VirusTotal request failed with %s using key %s, retrying in %ss",
+                        exc,
+                        key.fingerprint,
+                        sleep_for,
+                    )
+                    time.sleep(sleep_for)
+                    continue
 
             self.record_vt_request(method, path, response.status_code)
 

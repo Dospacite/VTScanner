@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -144,6 +145,7 @@ class VTKeyState:
     min_interval_seconds: float
     cooldown_until: float = 0.0
     last_reserved_at: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @classmethod
     def from_api_key(
@@ -186,11 +188,12 @@ class VTKeyState:
 
     def wait(self) -> None:
         while True:
-            now = time.time()
-            wait = self.next_available_in(now)
-            if wait <= 0:
-                self.reserve(now)
-                return
+            with self.lock:
+                now = time.time()
+                wait = self.next_available_in(now)
+                if wait <= 0:
+                    self.reserve(now)
+                    return
             logging.info(
                 "VirusTotal key %s rate-limited, sleeping %.2fs",
                 self.fingerprint,
@@ -199,7 +202,8 @@ class VTKeyState:
             time.sleep(min(max(wait, 0.25), 60.0))
 
     def mark_rate_limited(self, cooldown_seconds: float) -> None:
-        self.cooldown_until = max(self.cooldown_until, time.time() + cooldown_seconds)
+        with self.lock:
+            self.cooldown_until = max(self.cooldown_until, time.time() + cooldown_seconds)
 
 
 class VTScannerService:
@@ -261,9 +265,9 @@ class VTScannerService:
         self.vt_day_limit = getenv_int("VT_DAY_LIMIT", 20000)
         self.vt_day_window_seconds = getenv_int("VT_DAY_WINDOW_SECONDS", 86400)
         self.vt_min_request_spacing_seconds = getenv_int(
-            "VT_MIN_REQUEST_SPACING_SECONDS", 0
+            "VT_MIN_REQUEST_SPACING_SECONDS", 1
         )
-        self.vt_disable_throttle = getenv_bool("VT_DISABLE_THROTTLE", True)
+        self.vt_disable_throttle = getenv_bool("VT_DISABLE_THROTTLE", False)
         self.vt_rate_limit_cooldown_seconds = getenv_int(
             "VT_RATE_LIMIT_COOLDOWN_SECONDS", 180
         )

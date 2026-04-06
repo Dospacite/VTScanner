@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -33,6 +34,25 @@ URLSCAN_LIVE_URL = "https://urlscan.io/json/live/"
 
 class RetryableError(RuntimeError):
     """Signals a transient failure that should be retried later."""
+
+
+class RateLimitError(RuntimeError):
+    """Signals a rate limit response with an explicit cooldown."""
+
+    def __init__(self, message: str, cooldown_seconds: float) -> None:
+        super().__init__(message)
+        self.cooldown_seconds = cooldown_seconds
+
+
+@dataclass
+class VTRequestStats:
+    day: str
+    total_requests: int = 0
+    submit_requests: int = 0
+    analysis_requests: int = 0
+    other_requests: int = 0
+    successful_requests: int = 0
+    quota_429s: int = 0
 
 
 def utcnow() -> datetime:
@@ -164,68 +184,22 @@ class VTKeyState:
         self.day_limiter.reserve(now)
         self.last_reserved_at = now
 
-    def mark_rate_limited(self, cooldown_seconds: float) -> None:
-        self.cooldown_until = max(self.cooldown_until, time.time() + cooldown_seconds)
-
-
-class VTKeyPool:
-    def __init__(
-        self,
-        api_keys: list[str],
-        *,
-        minute_limit: int,
-        minute_window_seconds: int,
-        day_limit: int,
-        day_window_seconds: int,
-        min_interval_seconds: float,
-    ) -> None:
-        if not api_keys:
-            raise ValueError("At least one VirusTotal API key is required.")
-        self.keys = [
-            VTKeyState.from_api_key(
-                key,
-                minute_limit=minute_limit,
-                minute_window_seconds=minute_window_seconds,
-                day_limit=day_limit,
-                day_window_seconds=day_window_seconds,
-                min_interval_seconds=min_interval_seconds,
-            )
-            for key in api_keys
-        ]
-        self.next_index = 0
-
-    def acquire(self) -> VTKeyState:
+    def wait(self) -> None:
         while True:
             now = time.time()
-            best_key: VTKeyState | None = None
-            best_wait: float | None = None
-            total_keys = len(self.keys)
-            for offset in range(total_keys):
-                key = self.keys[(self.next_index + offset) % total_keys]
-                wait = key.next_available_in(now)
-                if wait <= 0:
-                    key.reserve(now)
-                    self.next_index = (self.next_index + offset + 1) % total_keys
-                    return key
-                if best_wait is None or wait < best_wait:
-                    best_key = key
-                    best_wait = wait
-            if best_key is None or best_wait is None:
-                raise RuntimeError("VirusTotal key scheduler failed unexpectedly.")
+            wait = self.next_available_in(now)
+            if wait <= 0:
+                self.reserve(now)
+                return
             logging.info(
-                "All VirusTotal keys are rate-limited, waiting %.2fs for key %s",
-                best_wait,
-                best_key.fingerprint,
+                "VirusTotal key %s rate-limited, sleeping %.2fs",
+                self.fingerprint,
+                wait,
             )
-            time.sleep(min(max(best_wait, 0.25), 60.0))
+            time.sleep(min(max(wait, 0.25), 60.0))
 
-    def mark_rate_limited(self, key: VTKeyState, cooldown_seconds: float) -> None:
-        key.mark_rate_limited(cooldown_seconds)
-        logging.warning(
-            "Cooling down VirusTotal key %s for %.1fs after rate limit response",
-            key.fingerprint,
-            cooldown_seconds,
-        )
+    def mark_rate_limited(self, cooldown_seconds: float) -> None:
+        self.cooldown_until = max(self.cooldown_until, time.time() + cooldown_seconds)
 
 
 class VTScannerService:
@@ -235,9 +209,9 @@ class VTScannerService:
         self.mongo_uri = os.environ["MONGO_URI"]
         self.gsb_api_key = os.environ["GOOGLE_SAFE_BROWSING_API_KEY"]
         self.urlscan_api_key = os.environ["URLSCAN_API_KEY"]
+        self.vt_api_key = os.environ["VT_API_KEY"]
         self.mongo_db_name = os.getenv("MONGO_DB_NAME", "urlscan")
         self.mongo_collection_name = os.getenv("MONGO_COLLECTION_NAME", "live")
-        self.vt_keys_file = os.getenv("VT_API_KEYS_FILE", "VTAPIKEYS.txt")
 
         self.request_timeout = getenv_int("REQUEST_TIMEOUT_SECONDS", 60)
         self.error_sleep_seconds = getenv_int("ERROR_SLEEP_SECONDS", 30)
@@ -245,32 +219,92 @@ class VTScannerService:
         self.t7_days = getenv_int("T7_DELAY_DAYS", 7)
         self.scrape_html_max_bytes = getenv_int("SCRAPE_HTML_MAX_BYTES", 524288)
         self.scrape_headless = getenv_bool("SCRAPE_HEADLESS", True)
-        self.vt_batch_size = getenv_int("VT_BATCH_SIZE", 100)
-        self.vt_collect_batch_size = getenv_int("VT_COLLECT_BATCH_SIZE", self.vt_batch_size)
-        self.vt_pending_target = getenv_int("VT_PENDING_TARGET", max(self.vt_batch_size * 3, 300))
-        self.vt_batch_settle_seconds = getenv_int("VT_BATCH_SETTLE_SECONDS", 300)
+        self.scrape_worker_count = max(getenv_int("SCRAPE_WORKER_COUNT", 4), 1)
+        self.vt_batch_size = getenv_int("VT_BATCH_SIZE", 128)
+        self.vt_collect_batch_size = getenv_int(
+            "VT_COLLECT_BATCH_SIZE", self.vt_batch_size
+        )
+        self.vt_pending_target = getenv_int("VT_PENDING_TARGET", self.vt_batch_size)
+        self.vt_batch_settle_seconds = getenv_int("VT_BATCH_SETTLE_SECONDS", 180)
         self.vt_batch_poll_interval_seconds = getenv_int(
             "VT_BATCH_POLL_INTERVAL_SECONDS", 30
         )
-        self.vt_batch_max_wait_seconds = getenv_int(
-            "VT_BATCH_MAX_WAIT_SECONDS", 900
+        self.vt_submission_worker_count = max(
+            getenv_int("VT_SUBMISSION_WORKER_COUNT", 8), 1
         )
-        self.vt_minute_limit = getenv_int("VT_MINUTE_LIMIT", 3)
-        self.vt_minute_window_seconds = getenv_int("VT_MINUTE_WINDOW_SECONDS", 75)
-        self.vt_day_limit = getenv_int("VT_DAY_LIMIT", 480)
+        self.vt_analysis_worker_count = max(
+            getenv_int("VT_ANALYSIS_WORKER_COUNT", 32), 1
+        )
+        self.vt_submission_max_inflight = max(
+            getenv_int(
+                "VT_SUBMISSION_MAX_INFLIGHT",
+                max(self.vt_batch_size, self.vt_submission_worker_count * 4),
+            ),
+            1,
+        )
+        self.vt_analysis_max_inflight = max(
+            getenv_int(
+                "VT_ANALYSIS_MAX_INFLIGHT",
+                max(self.vt_collect_batch_size, self.vt_analysis_worker_count * 2),
+            ),
+            1,
+        )
+        self.vt_pending_backoff_multiplier = getenv_int(
+            "VT_PENDING_BACKOFF_MULTIPLIER", 1
+        )
+        self.vt_pending_max_poll_interval_seconds = getenv_int(
+            "VT_PENDING_MAX_POLL_INTERVAL_SECONDS",
+            self.vt_batch_poll_interval_seconds,
+        )
+        self.vt_minute_limit = getenv_int("VT_MINUTE_LIMIT", 20000)
+        self.vt_minute_window_seconds = getenv_int("VT_MINUTE_WINDOW_SECONDS", 60)
+        self.vt_day_limit = getenv_int("VT_DAY_LIMIT", 20000)
         self.vt_day_window_seconds = getenv_int("VT_DAY_WINDOW_SECONDS", 86400)
         self.vt_min_request_spacing_seconds = getenv_int(
-            "VT_MIN_REQUEST_SPACING_SECONDS", 17
+            "VT_MIN_REQUEST_SPACING_SECONDS", 0
         )
+        self.vt_disable_throttle = getenv_bool("VT_DISABLE_THROTTLE", True)
         self.vt_rate_limit_cooldown_seconds = getenv_int(
             "VT_RATE_LIMIT_COOLDOWN_SECONDS", 180
+        )
+        self.vt_submit_retry_cooldown_seconds = getenv_int(
+            "VT_SUBMIT_RETRY_COOLDOWN_SECONDS",
+            max(self.vt_rate_limit_cooldown_seconds, 300),
+        )
+        self.vt_analysis_retry_cooldown_seconds = getenv_int(
+            "VT_ANALYSIS_RETRY_COOLDOWN_SECONDS",
+            max(self.vt_rate_limit_cooldown_seconds, 300),
         )
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "VTScanner/1.0"})
+        self.vt_submission_executor = ThreadPoolExecutor(
+            max_workers=self.vt_submission_worker_count,
+            thread_name_prefix="virustotal-submit",
+        )
+        self.vt_analysis_executor = ThreadPoolExecutor(
+            max_workers=self.vt_analysis_worker_count,
+            thread_name_prefix="virustotal-analysis",
+        )
+        self.gsb_session = requests.Session()
+        self.gsb_session.headers.update({"User-Agent": "VTScanner/1.0"})
+        self.gsb_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="google-safe-browsing",
+        )
+        self.gsb_rate_limit_until = datetime.min.replace(tzinfo=UTC)
+        self.scrape_executor = ThreadPoolExecutor(
+            max_workers=self.scrape_worker_count,
+            thread_name_prefix="scrapling",
+        )
+        self.vt_submission_futures: dict[Future[Any], dict[str, Any]] = {}
+        self.vt_analysis_futures: dict[Future[Any], dict[str, Any]] = {}
+        self.gsb_futures: dict[Future[Any], dict[str, Any]] = {}
+        self.scrape_futures: dict[Future[Any], dict[str, Any]] = {}
+        self.vt_request_stats = VTRequestStats(day=utcnow().date().isoformat())
 
-        self.vt_pool = VTKeyPool(
-            self._load_vt_keys(self.vt_keys_file),
+        self.vt_key = VTKeyState.from_api_key(
+            self.vt_api_key,
             minute_limit=self.vt_minute_limit,
             minute_window_seconds=self.vt_minute_window_seconds,
             day_limit=self.vt_day_limit,
@@ -292,13 +326,6 @@ class VTScannerService:
             self.mongo_collection_name
         ]
 
-    def _load_vt_keys(self, path: str) -> list[str]:
-        with open(path, "r", encoding="utf-8") as handle:
-            keys = [line.strip() for line in handle if line.strip()]
-        if not keys:
-            raise ValueError(f"No VirusTotal API keys found in {path}.")
-        return keys
-
     def ensure_indexes(self) -> None:
         self.collection.create_index([("task.url", ASCENDING)], name="task_url_idx")
         self.collection.create_index(
@@ -318,6 +345,30 @@ class VTScannerService:
         self.collection.create_index(
             [("scans.T7_pending.submitted_at", ASCENDING)],
             name="t7_pending_submitted_idx",
+        )
+        self.collection.create_index(
+            [("scans.T0_pending.next_poll_due_at", ASCENDING)],
+            name="t0_pending_next_poll_due_idx",
+        )
+        self.collection.create_index(
+            [("scans.T0_queue.queued_at", ASCENDING)],
+            name="t0_queue_queued_at_idx",
+        )
+        self.collection.create_index(
+            [("scans.T7_queue.queued_at", ASCENDING)],
+            name="t7_queue_queued_at_idx",
+        )
+        self.collection.create_index(
+            [("scans.T7_pending.next_poll_due_at", ASCENDING)],
+            name="t7_pending_next_poll_due_idx",
+        )
+        self.collection.create_index(
+            [("scans.T0_gsb_pending.submitted_at", ASCENDING)],
+            name="t0_gsb_pending_submitted_idx",
+        )
+        self.collection.create_index(
+            [("scans.T7_gsb_pending.submitted_at", ASCENDING)],
+            name="t7_gsb_pending_submitted_idx",
         )
 
     def inspect_existing_format(self) -> None:
@@ -371,27 +422,36 @@ class VTScannerService:
     def run_forever(self) -> None:
         self.ensure_indexes()
         self.purge_legacy_scan_fields()
+        self.ensure_t0_queue_for_unscanned_urls()
+        self.ensure_t7_queue_for_due_urls()
         self.inspect_existing_format()
         logging.info("Starting scanner loop on %s.%s", self.mongo_db_name, self.mongo_collection_name)
 
         while True:
             try:
                 did_work = False
+                if self.ensure_t0_queue_for_unscanned_urls() > 0:
+                    did_work = True
+                if self.ensure_t7_queue_for_due_urls() > 0:
+                    did_work = True
+
                 if self.process_pending_t7_scrape():
                     did_work = True
 
-                finalized_count, polled_count, pending_count = (
-                    self.process_pending_virustotal_results()
-                )
-                if finalized_count > 0 or polled_count > 0:
+                vt_work_count, pending_count = self.process_pending_virustotal_results()
+                if vt_work_count > 0:
                     did_work = True
 
-                current_pending_count = max(pending_count - finalized_count, 0)
+                gsb_work_count, gsb_has_more_work = self.process_google_safe_browsing_queue()
+                if gsb_work_count > 0:
+                    did_work = True
+
+                current_pending_count = pending_count + len(self.vt_submission_futures)
                 submitted_count = self.fill_virustotal_submission_queue(current_pending_count)
                 if submitted_count > 0:
                     did_work = True
 
-                if current_pending_count == 0 and submitted_count == 0:
+                if not gsb_has_more_work:
                     inserted = self.backfill_from_live_feed()
                     if inserted > 0:
                         did_work = True
@@ -407,68 +467,228 @@ class VTScannerService:
                 logging.exception("Scanner loop failed. Sleeping for %ss.", self.error_sleep_seconds)
                 time.sleep(self.error_sleep_seconds)
 
-    def process_pending_t7_scrape(self) -> bool:
-        doc = self.collection.find_one(
+    def ensure_t0_queue_for_unscanned_urls(self) -> int:
+        queued_at = utcnow()
+        result = self.collection.update_many(
             {
-                "task.url": {"$type": "string", "$ne": ""},
-                "scans.T7.change_detection.significant": True,
-                "$or": [
-                    {"scans.T7.scrape": {"$exists": False}},
-                    {"scans.T7.scrape.status": {"$ne": "success"}},
-                ],
+                "$and": [
+                    {"task.url": {"$type": "string", "$ne": ""}},
+                    {"scans.T0.virustotal": {"$exists": False}},
+                    {"scans.T0_pending": {"$exists": False}},
+                    {"scans.T0_queue": {"$exists": False}},
+                ]
             },
-            sort=[("scans.T7.completed_at", ASCENDING)],
-        )
-        if not doc:
-            return False
-
-        url = doc["task"]["url"]
-        logging.info("Retrying pending T7 scrape for %s", url)
-        scrape = self.scrape_url(
-            url=url,
-            reason="retry_pending_significant_change",
-            previous_scrape=doc.get("scans", {}).get("T7", {}).get("scrape"),
-        )
-        self.update_document(
-            doc["_id"],
             {
                 "$set": {
-                    "scans.T7.scrape": scrape,
-                    "scans.last_updated_at": utcnow(),
+                    "scans.T0_queue": {
+                        "queued_at": queued_at,
+                        "source": "missing_t0_backfill",
+                    },
+                    "scans.last_updated_at": queued_at,
                 }
             },
         )
-        return True
+        if result.modified_count > 0:
+            logging.info(
+                "Queued %s URLs missing T0 VirusTotal scans.",
+                result.modified_count,
+            )
+        return int(result.modified_count)
 
-    def count_pending_virustotal_documents(self) -> int:
-        return self.collection.count_documents(
+    def ensure_t7_queue_for_due_urls(self) -> int:
+        queued_at = utcnow()
+        due_cutoff = queued_at - timedelta(days=self.t7_days)
+        result = self.collection.update_many(
             {
-                "$or": [
-                    {"scans.T0_pending": {"$exists": True}},
-                    {"scans.T7_pending": {"$exists": True}},
+                "$and": [
+                    {"task.url": {"$type": "string", "$ne": ""}},
+                    {"scans.T0.completed_at": {"$exists": True}},
+                    {"scans.T7.virustotal": {"$exists": False}},
+                    {"scans.T7_pending": {"$exists": False}},
+                    {"scans.T7_queue": {"$exists": False}},
+                    {"scans.T7.ignored": {"$ne": True}},
+                    {
+                        "$or": [
+                            {"scans.T7_submit_retry_at": {"$exists": False}},
+                            {"scans.T7_submit_retry_at": {"$lte": queued_at}},
+                        ]
+                    },
+                    {
+                        "$or": [
+                            {"scans.T0.next_scan_due_at": {"$lte": queued_at}},
+                            {
+                                "$and": [
+                                    {"scans.T0.next_scan_due_at": {"$exists": False}},
+                                    {"scans.T0.completed_at": {"$lte": due_cutoff}},
+                                ]
+                            },
+                        ]
+                    },
                 ]
-            }
+            },
+            {
+                "$set": {
+                    "scans.T7_queue": {
+                        "queued_at": queued_at,
+                        "source": "due_t7_backfill",
+                    },
+                    "scans.last_updated_at": queued_at,
+                }
+            },
         )
+        if result.modified_count > 0:
+            logging.info(
+                "Queued %s URLs due for T7 VirusTotal scans.",
+                result.modified_count,
+            )
+        return int(result.modified_count)
 
-    def list_pending_virustotal_entries(self) -> list[dict[str, Any]]:
+    def process_pending_t7_scrape(self) -> bool:
+        completed_count = self.collect_completed_scrape_futures()
+        capacity = self.scrape_worker_count - len(self.scrape_futures)
+        if capacity <= 0:
+            return completed_count > 0
+
         docs = list(
             self.collection.find(
                 {
+                    "task.url": {"$type": "string", "$ne": ""},
+                    "scans.T7.change_detection.significant": True,
+                    "scans.T7.ignored": {"$ne": True},
                     "$or": [
-                        {"scans.T0_pending": {"$exists": True}},
-                        {"scans.T7_pending": {"$exists": True}},
-                    ]
+                        {"scans.T7.scrape": {"$exists": False}},
+                        {"scans.T7.scrape.status": {"$ne": "success"}},
+                    ],
                 },
-                {
-                    "task.url": 1,
-                    "scans.T0": 1,
-                    "scans.T0_pending": 1,
-                    "scans.T7_pending": 1,
-                },
+                sort=[("scans.T7.completed_at", ASCENDING)],
+                limit=capacity,
             )
         )
-        entries: list[dict[str, Any]] = []
+        if not docs:
+            return completed_count > 0
+
+        scheduled_count = 0
         for doc in docs:
+            url = doc["task"]["url"]
+            logging.info("Queueing pending T7 scrape retry for %s", url)
+            if self.queue_scrape_work(
+                document_id=doc["_id"],
+                stage="T7",
+                url=url,
+                reason="retry_pending_significant_change",
+                previous_scrape=doc.get("scans", {}).get("T7", {}).get("scrape"),
+            ):
+                scheduled_count += 1
+
+        return (completed_count + scheduled_count) > 0
+
+    def has_inflight_scrape(self, document_id: Any, stage: str) -> bool:
+        return any(
+            meta.get("document_id") == document_id and meta.get("stage") == stage
+            for meta in self.scrape_futures.values()
+        )
+
+    def has_successful_scrape(self, scan: dict[str, Any]) -> bool:
+        return ((scan.get("scrape") or {}).get("status") == "success")
+
+    def count_pending_virustotal_documents(self, limit: int | None = None) -> int:
+        if limit is None:
+            limit = self.vt_pending_target + 1
+        if limit <= 0:
+            return 0
+
+        projections = {"_id": 1}
+        pending_ids: set[Any] = set()
+        stage_queries = [
+            ("scans.T7_pending.submitted_at", {"scans.T7_pending.submitted_at": {"$exists": True}}),
+            ("scans.T0_pending.submitted_at", {"scans.T0_pending.submitted_at": {"$exists": True}}),
+        ]
+        for sort_field, query in stage_queries:
+            remaining = limit - len(pending_ids)
+            if remaining <= 0:
+                break
+            cursor = self.collection.find(
+                query,
+                projections,
+                sort=[(sort_field, ASCENDING), ("_id", ASCENDING)],
+                limit=remaining,
+            )
+            for doc in cursor:
+                pending_ids.add(doc["_id"])
+                if len(pending_ids) >= limit:
+                    break
+        return len(pending_ids)
+
+    def pending_entry_projection(self) -> dict[str, int]:
+        return {
+            "task.url": 1,
+            "scans.T0_pending": 1,
+            "scans.T7_pending": 1,
+            "scans.T0.virustotal.malicious_engine_count": 1,
+            "scans.T0.google_safe_browsing.matched": 1,
+        }
+
+    def list_ready_pending_virustotal_entries(self, limit: int) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+
+        now = utcnow()
+        legacy_cutoff = now - timedelta(seconds=self.vt_batch_settle_seconds)
+        stage_queries = [
+            (
+                "scans.T7_pending.next_poll_due_at",
+                {
+                    "$or": [
+                        {"scans.T7_pending.next_poll_due_at": {"$lte": now}},
+                        {
+                            "$and": [
+                                {"scans.T7_pending": {"$exists": True}},
+                                {"scans.T7_pending.next_poll_due_at": {"$exists": False}},
+                                {"scans.T7_pending.submitted_at": {"$lte": legacy_cutoff}},
+                            ]
+                        },
+                    ]
+                },
+            ),
+            (
+                "scans.T0_pending.next_poll_due_at",
+                {
+                    "$or": [
+                        {"scans.T0_pending.next_poll_due_at": {"$lte": now}},
+                        {
+                            "$and": [
+                                {"scans.T0_pending": {"$exists": True}},
+                                {"scans.T0_pending.next_poll_due_at": {"$exists": False}},
+                                {"scans.T0_pending.submitted_at": {"$lte": legacy_cutoff}},
+                            ]
+                        },
+                    ]
+                },
+            ),
+        ]
+
+        docs: list[dict[str, Any]] = []
+        for sort_field, query in stage_queries:
+            docs.extend(
+                list(
+                    self.collection.find(
+                        query,
+                        self.pending_entry_projection(),
+                        sort=[
+                            (sort_field, ASCENDING),
+                            ("_id", ASCENDING),
+                        ],
+                        limit=limit,
+                    )
+                )
+            )
+
+        deduped_docs: dict[Any, dict[str, Any]] = {}
+        for doc in docs:
+            deduped_docs[doc["_id"]] = doc
+
+        ready_entries: list[dict[str, Any]] = []
+        for doc in deduped_docs.values():
             scans = doc.get("scans") or {}
             for stage in ("T7", "T0"):
                 pending = scans.get(f"{stage}_pending")
@@ -476,8 +696,13 @@ class VTScannerService:
                     continue
                 submitted_at = pending.get("submitted_at")
                 if not isinstance(submitted_at, datetime):
-                    submitted_at = utcnow()
-                entries.append(
+                    submitted_at = now
+                next_poll_due_at = pending.get("next_poll_due_at")
+                if isinstance(next_poll_due_at, datetime) and next_poll_due_at > now:
+                    continue
+                if next_poll_due_at is None and submitted_at > legacy_cutoff:
+                    continue
+                ready_entries.append(
                     {
                         "document_id": doc["_id"],
                         "document": doc,
@@ -487,108 +712,444 @@ class VTScannerService:
                         "pending": pending,
                         "submitted_at": submitted_at,
                         "last_polled_at": pending.get("last_polled_at"),
+                        "next_poll_due_at": next_poll_due_at,
                     }
                 )
 
-        entries.sort(
+        ready_entries.sort(
             key=lambda entry: (
-                entry["submitted_at"],
+                entry["next_poll_due_at"] or entry["submitted_at"],
                 0 if entry["stage"] == "T7" else 1,
             )
         )
-        return entries
+        return ready_entries[:limit]
 
-    def process_pending_virustotal_results(self) -> tuple[int, int, int]:
-        pending_entries = self.list_pending_virustotal_entries()
-        pending_count = len(pending_entries)
-        if pending_count == 0:
-            return 0, 0, 0
+    def process_pending_virustotal_results(self) -> tuple[int, int]:
+        pending_count = self.count_pending_virustotal_documents(limit=1)
+        work_count = 0
 
-        now = utcnow()
-        settle_cutoff = now - timedelta(seconds=self.vt_batch_settle_seconds)
-        poll_cutoff = now - timedelta(seconds=self.vt_batch_poll_interval_seconds)
-        ready_entries: list[dict[str, Any]] = []
+        work_count += self.collect_completed_vt_analysis_futures()
 
-        for entry in pending_entries:
-            if entry["submitted_at"] > settle_cutoff:
-                continue
-            last_polled_at = entry["last_polled_at"]
-            if isinstance(last_polled_at, datetime) and last_polled_at > poll_cutoff:
-                continue
-            ready_entries.append(entry)
-            if len(ready_entries) >= self.vt_collect_batch_size:
-                break
+        available_slots = max(
+            self.vt_analysis_max_inflight - self.count_inflight_vt_analyses(),
+            0,
+        )
+        if pending_count == 0 or available_slots == 0:
+            return work_count, pending_count
 
-        finalized_count = 0
-        polled_count = 0
+        ready_entries = self.list_ready_pending_virustotal_entries(
+            min(self.vt_collect_batch_size, available_slots)
+        )
+        if not ready_entries:
+            return work_count, pending_count
+
         for entry in ready_entries:
-            analysis_id = entry["pending"]["analysis_id"]
-            try:
-                analysis = self.fetch_virustotal_analysis(analysis_id)
-            except Exception:
-                logging.exception(
-                    "Failed to collect VirusTotal analysis %s for %s",
-                    analysis_id,
-                    entry["url"],
-                )
+            if self.has_inflight_vt_analysis(entry["document_id"], entry["stage"]):
                 continue
-
-            status = (
-                analysis.get("data", {})
-                .get("attributes", {})
-                .get("status")
+            analysis_id = entry["pending"]["analysis_id"]
+            logging.info(
+                "Queueing VirusTotal analysis fetch %s for %s",
+                analysis_id,
+                entry["url"],
             )
-            if status == "completed":
-                self.finalize_pending_virustotal_result(entry, analysis)
-                finalized_count += 1
-            else:
-                self.mark_pending_virustotal_polled(entry)
-                polled_count += 1
+            future = self.vt_analysis_executor.submit(
+                self.fetch_virustotal_analysis, analysis_id
+            )
+            self.vt_analysis_futures[future] = entry
+            work_count += 1
 
-        return finalized_count, polled_count, pending_count
+        return work_count, pending_count
+
+    def has_inflight_vt_analysis(self, document_id: Any, stage: str) -> bool:
+        return any(
+            meta.get("document_id") == document_id and meta.get("stage") == stage
+            for meta in self.vt_analysis_futures.values()
+        )
+
+    def count_inflight_vt_submissions(self) -> int:
+        return len(self.vt_submission_futures)
+
+    def count_inflight_vt_analyses(self) -> int:
+        return len(self.vt_analysis_futures)
 
     def fill_virustotal_submission_queue(self, known_pending_count: int | None = None) -> int:
+        completed_count = self.collect_completed_vt_submission_futures()
         pending_count = (
-            self.count_pending_virustotal_documents()
+            self.count_pending_virustotal_documents(
+                limit=self.vt_pending_target + len(self.vt_submission_futures) + 1
+            )
             if known_pending_count is None
             else known_pending_count
         )
-        available_slots = max(self.vt_pending_target - pending_count, 0)
+        available_slots = max(
+            min(
+                self.vt_pending_target - pending_count - len(self.vt_submission_futures),
+                self.vt_submission_max_inflight - self.count_inflight_vt_submissions(),
+            ),
+            0,
+        )
         if available_slots == 0:
-            return 0
+            return completed_count
 
-        submitted_count = 0
+        scheduled_count = 0
 
-        t7_candidates = self.find_due_t7_candidates(min(self.vt_batch_size, available_slots))
-        submitted_count += self.submit_candidate_documents("T7", t7_candidates)
-        available_slots = max(available_slots - submitted_count, 0)
+        queued_t0_candidates = self.find_queued_t0_candidates(
+            min(self.vt_batch_size, available_slots)
+        )
+        scheduled = self.submit_candidate_documents("T0", queued_t0_candidates)
+        scheduled_count += scheduled
+        available_slots = max(available_slots - scheduled, 0)
+
+        if available_slots > 0:
+            queued_t7_candidates = self.find_queued_t7_candidates(
+                min(self.vt_batch_size, available_slots)
+            )
+            scheduled = self.submit_candidate_documents("T7", queued_t7_candidates)
+            scheduled_count += scheduled
+            available_slots = max(available_slots - scheduled, 0)
 
         if available_slots > 0:
             t0_candidates = self.find_missing_t0_candidates(
                 min(self.vt_batch_size, available_slots)
             )
-            submitted_count += self.submit_candidate_documents("T0", t0_candidates)
+            scheduled_count += self.submit_candidate_documents("T0", t0_candidates)
 
+        return completed_count + scheduled_count
+
+    def find_queued_t0_candidates(self, limit: int) -> list[dict[str, Any]]:
+        now = utcnow()
+        return list(
+            self.collection.find(
+                {
+                    "$and": [
+                        {"task.url": {"$type": "string", "$ne": ""}},
+                        {"scans.T0_queue": {"$exists": True}},
+                        {"scans.T0.virustotal": {"$exists": False}},
+                        {"scans.T0_pending": {"$exists": False}},
+                        {
+                            "$or": [
+                                {"scans.T0_submit_retry_at": {"$exists": False}},
+                                {"scans.T0_submit_retry_at": {"$lte": now}},
+                            ]
+                        },
+                    ],
+                },
+                sort=[
+                    ("scans.T0_queue.queued_at", ASCENDING),
+                    ("task.time", ASCENDING),
+                    ("_id", ASCENDING),
+                ],
+                limit=limit,
+            )
+        )
+
+    def find_queued_t7_candidates(self, limit: int) -> list[dict[str, Any]]:
+        now = utcnow()
+        return list(
+            self.collection.find(
+                {
+                    "$and": [
+                        {"task.url": {"$type": "string", "$ne": ""}},
+                        {"scans.T7_queue": {"$exists": True}},
+                        {"scans.T7.virustotal": {"$exists": False}},
+                        {"scans.T7_pending": {"$exists": False}},
+                        {"scans.T7.ignored": {"$ne": True}},
+                        {
+                            "$or": [
+                                {"scans.T7_submit_retry_at": {"$exists": False}},
+                                {"scans.T7_submit_retry_at": {"$lte": now}},
+                            ]
+                        },
+                    ],
+                },
+                sort=[
+                    ("scans.T7_queue.queued_at", ASCENDING),
+                    ("scans.T0.completed_at", ASCENDING),
+                    ("_id", ASCENDING),
+                ],
+                limit=limit,
+            )
+        )
+
+    def process_google_safe_browsing_queue(self) -> tuple[int, bool]:
+        work_count = self.collect_completed_gsb_futures()
+        if len(self.gsb_futures) > 0:
+            return work_count, True
+
+        now = utcnow()
+        if now < self.gsb_rate_limit_until:
+            remaining = (self.gsb_rate_limit_until - now).total_seconds()
+            logging.info(
+                "Google Safe Browsing cooldown active for %.0fs; skipping queue.",
+                remaining,
+            )
+            return work_count, False
+
+        pending_entries = self.list_ready_pending_google_safe_browsing_entries(1)
+        if pending_entries:
+            entry = pending_entries[0]
+            self.queue_google_safe_browsing_pending_entry(entry)
+            return work_count + 1, True
+
+        t7_candidates = self.find_due_t7_gsb_candidates(1)
+        if t7_candidates:
+            return work_count + self.submit_google_safe_browsing_candidates("T7", t7_candidates), True
+
+        t0_candidates = self.find_missing_t0_gsb_candidates(1)
+        if t0_candidates:
+            return work_count + self.submit_google_safe_browsing_candidates("T0", t0_candidates), True
+
+        return work_count, False
+
+    def list_ready_pending_google_safe_browsing_entries(
+        self, limit: int
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+
+        docs = list(
+            self.collection.find(
+                {
+                    "$or": [
+                        {"scans.T0_gsb_pending": {"$exists": True}},
+                        {"scans.T7_gsb_pending": {"$exists": True}},
+                    ]
+                },
+                {
+                    "task.url": 1,
+                    "scans.T0_gsb_pending": 1,
+                    "scans.T7_gsb_pending": 1,
+                },
+                sort=[("_id", ASCENDING)],
+                limit=max(limit * 2, 4),
+            )
+        )
+        entries: list[dict[str, Any]] = []
+        for doc in docs:
+            scans = doc.get("scans") or {}
+            for stage in ("T7", "T0"):
+                pending = scans.get(f"{stage}_gsb_pending")
+                if not isinstance(pending, dict):
+                    continue
+                entries.append(
+                    {
+                        "document_id": doc["_id"],
+                        "stage": stage,
+                        "url": pending.get("requested_url") or doc.get("task", {}).get("url"),
+                        "pending": pending,
+                    }
+                )
+        entries.sort(
+            key=lambda entry: (
+                (entry["pending"].get("submitted_at") or utcnow()),
+                0 if entry["stage"] == "T7" else 1,
+            )
+        )
+        return entries[:limit]
+
+    def find_due_t7_gsb_candidates(self, limit: int) -> list[dict[str, Any]]:
+        now = utcnow()
+        return list(
+            self.collection.find(
+                {
+                    "$and": [
+                        {"task.url": {"$type": "string", "$ne": ""}},
+                        {"scans.T0.completed_at": {"$exists": True}},
+                        {"scans.T7_gsb_pending": {"$exists": False}},
+                        {"scans.T7.google_safe_browsing": {"$exists": False}},
+                        {"scans.T7.ignored": {"$ne": True}},
+                        {
+                            "$or": [
+                                {"scans.T7_gsb_retry_at": {"$exists": False}},
+                                {"scans.T7_gsb_retry_at": {"$lte": now}},
+                            ]
+                        },
+                        {
+                            "$or": [
+                                {"scans.T0.next_scan_due_at": {"$lte": now}},
+                                {
+                                    "$and": [
+                                        {"scans.T0.next_scan_due_at": {"$exists": False}},
+                                        {
+                                            "scans.T0.completed_at": {
+                                                "$lte": now - timedelta(days=self.t7_days)
+                                            }
+                                        },
+                                    ]
+                                },
+                            ]
+                        },
+                    ]
+                },
+                sort=[("scans.T0.completed_at", ASCENDING)],
+                limit=limit,
+            )
+        )
+
+    def find_missing_t0_gsb_candidates(self, limit: int) -> list[dict[str, Any]]:
+        now = utcnow()
+        return list(
+            self.collection.find(
+                {
+                    "$and": [
+                        {"task.url": {"$type": "string", "$ne": ""}},
+                        {"scans.T0_gsb_pending": {"$exists": False}},
+                        {"scans.T0.google_safe_browsing": {"$exists": False}},
+                        {
+                            "$or": [
+                                {"scans.T0_gsb_retry_at": {"$exists": False}},
+                                {"scans.T0_gsb_retry_at": {"$lte": now}},
+                            ]
+                        },
+                    ]
+                },
+                sort=[("task.time", ASCENDING), ("_id", ASCENDING)],
+                limit=limit,
+            )
+        )
+
+    def submit_google_safe_browsing_candidates(
+        self, stage: str, docs: list[dict[str, Any]]
+    ) -> int:
+        submitted_count = 0
+        for doc in docs:
+            url = doc["task"]["url"]
+            pending_payload = {
+                "requested_url": url,
+                "submitted_at": utcnow(),
+            }
+            result = self.collection.update_one(
+                {
+                    "_id": doc["_id"],
+                    f"scans.{stage}_gsb_pending": {"$exists": False},
+                    f"scans.{stage}.google_safe_browsing": {"$exists": False},
+                },
+                {
+                    "$set": {
+                        f"scans.{stage}_gsb_pending": pending_payload,
+                        "scans.last_updated_at": utcnow(),
+                    },
+                    "$unset": {
+                        f"scans.{stage}_gsb_retry_at": "",
+                        f"scans.{stage}_last_gsb_error": "",
+                    },
+                },
+            )
+            if result.matched_count != 1:
+                continue
+            self.queue_google_safe_browsing_pending_entry(
+                {
+                    "document_id": doc["_id"],
+                    "stage": stage,
+                    "url": url,
+                    "pending": pending_payload,
+                }
+            )
+            submitted_count += 1
         return submitted_count
+
+    def queue_google_safe_browsing_pending_entry(self, entry: dict[str, Any]) -> None:
+        future = self.gsb_executor.submit(self.check_google_safe_browsing, entry["url"])
+        self.gsb_futures[future] = entry
+
+    def collect_completed_gsb_futures(self) -> int:
+        completed_count = 0
+        for future in list(self.gsb_futures):
+            if not future.done():
+                continue
+            entry = self.gsb_futures.pop(future)
+            completed_count += 1
+            try:
+                gsb = future.result()
+            except Exception as exc:
+                logging.exception(
+                    "Failed to collect Google Safe Browsing result for %s",
+                    entry["url"],
+                )
+                failed_at = utcnow()
+                retry_at = failed_at + timedelta(seconds=self.error_sleep_seconds)
+                if isinstance(exc, RateLimitError):
+                    retry_at = failed_at + timedelta(seconds=exc.cooldown_seconds)
+                    if retry_at > self.gsb_rate_limit_until:
+                        self.gsb_rate_limit_until = retry_at
+                    self.collection.update_one(
+                        {"_id": entry["document_id"]},
+                        {
+                            "$unset": {f"scans.{entry['stage']}_gsb_pending": ""},
+                            "$set": {
+                                f"scans.{entry['stage']}_gsb_retry_at": retry_at,
+                                f"scans.{entry['stage']}_last_gsb_error": (
+                                    f"gsb_rate_limited_at={failed_at.isoformat()}"
+                                ),
+                                "scans.last_updated_at": failed_at,
+                            },
+                        },
+                    )
+                    continue
+                if entry["stage"] == "T7":
+                    self.ignore_t7_scan(
+                        entry["document_id"],
+                        reason="google_safe_browsing_failed",
+                    )
+                    continue
+                self.collection.update_one(
+                    {"_id": entry["document_id"]},
+                    {
+                        "$unset": {f"scans.{entry['stage']}_gsb_pending": ""},
+                        "$set": {
+                            f"scans.{entry['stage']}_gsb_retry_at": retry_at,
+                            f"scans.{entry['stage']}_last_gsb_error": (
+                                f"gsb_failed_at={failed_at.isoformat()}"
+                            ),
+                            "scans.last_updated_at": failed_at,
+                        },
+                    },
+                )
+                continue
+
+            partial_scan = {
+                "requested_url": entry["url"],
+                "started_at": entry["pending"].get("submitted_at") or utcnow(),
+                "completed_at": utcnow(),
+                "google_safe_browsing": gsb,
+            }
+            self.reconcile_stage_scan(
+                entry["document_id"],
+                entry["stage"],
+                partial_scan,
+                unset_paths=self.gsb_pending_clear_paths(entry["stage"]),
+            )
+        return completed_count
 
     def find_due_t7_candidates(self, limit: int) -> list[dict[str, Any]]:
         now = utcnow()
         return list(
             self.collection.find(
                 {
-                    "task.url": {"$type": "string", "$ne": ""},
-                    "scans.T0.completed_at": {"$exists": True},
-                    "scans.T7": {"$exists": False},
-                    "scans.T7_pending": {"$exists": False},
-                    "$or": [
-                        {"scans.T0.next_scan_due_at": {"$lte": now}},
+                    "$and": [
+                        {"task.url": {"$type": "string", "$ne": ""}},
+                        {"scans.T0.completed_at": {"$exists": True}},
+                        {"scans.T7.virustotal": {"$exists": False}},
+                        {"scans.T7_pending": {"$exists": False}},
+                        {"scans.T7.ignored": {"$ne": True}},
                         {
-                            "$and": [
-                                {"scans.T0.next_scan_due_at": {"$exists": False}},
+                            "$or": [
+                                {"scans.T7_submit_retry_at": {"$exists": False}},
+                                {"scans.T7_submit_retry_at": {"$lte": now}},
+                            ]
+                        },
+                        {
+                            "$or": [
+                                {"scans.T0.next_scan_due_at": {"$lte": now}},
                                 {
-                                    "scans.T0.completed_at": {
-                                        "$lte": now - timedelta(days=self.t7_days)
-                                    }
+                                    "$and": [
+                                        {"scans.T0.next_scan_due_at": {"$exists": False}},
+                                        {
+                                            "scans.T0.completed_at": {
+                                                "$lte": now - timedelta(days=self.t7_days)
+                                            }
+                                        },
+                                    ]
                                 },
                             ]
                         },
@@ -600,12 +1161,21 @@ class VTScannerService:
         )
 
     def find_missing_t0_candidates(self, limit: int) -> list[dict[str, Any]]:
+        now = utcnow()
         return list(
             self.collection.find(
                 {
-                    "task.url": {"$type": "string", "$ne": ""},
-                    "scans.T0": {"$exists": False},
-                    "scans.T0_pending": {"$exists": False},
+                    "$and": [
+                        {"task.url": {"$type": "string", "$ne": ""}},
+                        {"scans.T0.virustotal": {"$exists": False}},
+                        {"scans.T0_pending": {"$exists": False}},
+                        {
+                            "$or": [
+                                {"scans.T0_submit_retry_at": {"$exists": False}},
+                                {"scans.T0_submit_retry_at": {"$lte": now}},
+                            ]
+                        },
+                    ],
                 },
                 sort=[("task.time", ASCENDING), ("_id", ASCENDING)],
                 limit=limit,
@@ -618,99 +1188,287 @@ class VTScannerService:
         if not docs:
             return 0
 
-        logging.info("Submitting %s VirusTotal %s scans", len(docs), stage)
+        logging.info("Queueing %s VirusTotal %s scans", len(docs), stage)
         submitted_count = 0
         for doc in docs:
+            if self.has_inflight_vt_submission(doc["_id"], stage):
+                continue
             url = doc["task"]["url"]
-            try:
-                submission = self.submit_virustotal_scan(url)
-                pending_payload = {
-                    "requested_url": url,
-                    "submitted_at": submission["submitted_at"],
-                    "analysis_id": submission["analysis_id"],
-                    "submission": submission["submission_payload"],
-                    "last_polled_at": None,
-                    "poll_count": 0,
-                }
-                result = self.collection.update_one(
-                    {
-                        "_id": doc["_id"],
-                        f"scans.{stage}": {"$exists": False},
-                        f"scans.{stage}_pending": {"$exists": False},
-                    },
-                    {
-                        "$set": {
-                            f"scans.{stage}_pending": pending_payload,
-                            "scans.last_updated_at": utcnow(),
-                        }
-                    },
-                )
-                if result.matched_count != 1:
-                    logging.warning(
-                        "Skipped recording pending %s submission for %s because the document changed.",
-                        stage,
-                        url,
-                    )
-                    continue
-                submitted_count += 1
-            except Exception:
-                logging.exception(
-                    "Failed to submit VirusTotal %s scan for %s (%s)",
-                    stage,
-                    url,
-                    doc["_id"],
-                )
+            future = self.vt_submission_executor.submit(self.submit_virustotal_scan, url)
+            self.vt_submission_futures[future] = {
+                "document_id": doc["_id"],
+                "stage": stage,
+                "url": url,
+            }
+            submitted_count += 1
 
         return submitted_count
+
+    def has_inflight_vt_submission(self, document_id: Any, stage: str) -> bool:
+        return any(
+            meta.get("document_id") == document_id and meta.get("stage") == stage
+            for meta in self.vt_submission_futures.values()
+        )
+
+    def collect_completed_vt_submission_futures(self) -> int:
+        completed_count = 0
+        for future in list(self.vt_submission_futures):
+            if not future.done():
+                continue
+            meta = self.vt_submission_futures.pop(future)
+            completed_count += 1
+            self.handle_vt_submission_completion(meta, future)
+        return completed_count
+
+    def handle_vt_submission_completion(
+        self, meta: dict[str, Any], future: Future[Any]
+    ) -> None:
+        stage = meta["stage"]
+        url = meta["url"]
+        document_id = meta["document_id"]
+        try:
+            submission = future.result()
+            pending_payload = {
+                "requested_url": url,
+                "submitted_at": submission["submitted_at"],
+                "analysis_id": submission["analysis_id"],
+                "submission": submission["submission_payload"],
+                "last_polled_at": None,
+                "poll_count": 0,
+                "next_poll_due_at": submission["submitted_at"]
+                + timedelta(seconds=self.vt_batch_settle_seconds),
+            }
+            result = self.collection.update_one(
+                {
+                    "_id": document_id,
+                    f"scans.{stage}.virustotal": {"$exists": False},
+                    f"scans.{stage}_pending": {"$exists": False},
+                },
+                {
+                    "$set": {
+                        f"scans.{stage}_pending": pending_payload,
+                        "scans.last_updated_at": utcnow(),
+                    },
+                    "$unset": {
+                        **(
+                            {"scans.T0_queue": ""}
+                            if stage == "T0"
+                            else {"scans.T7_queue": ""}
+                        ),
+                        f"scans.{stage}_submit_retry_at": "",
+                        f"scans.{stage}_last_submit_error": "",
+                    },
+                },
+            )
+            if result.matched_count != 1:
+                logging.warning(
+                    "Skipped recording pending %s submission for %s because the document changed.",
+                    stage,
+                    url,
+                )
+        except Exception:
+            logging.exception(
+                "Failed to submit VirusTotal %s scan for %s (%s)",
+                stage,
+                url,
+                document_id,
+            )
+            if stage == "T7":
+                self.ignore_t7_scan(
+                    document_id,
+                    reason="virustotal_submission_failed",
+                )
+                return
+            failed_at = utcnow()
+            retry_at = failed_at + timedelta(
+                seconds=self.vt_submit_retry_cooldown_seconds
+            )
+            self.collection.update_one(
+                {"_id": document_id},
+                {
+                    "$set": {
+                        f"scans.{stage}_submit_retry_at": retry_at,
+                        f"scans.{stage}_last_submit_error": (
+                            f"submit_failed_at={failed_at.isoformat()}"
+                        ),
+                        "scans.last_updated_at": failed_at,
+                    }
+                },
+            )
 
     def mark_pending_virustotal_polled(self, entry: dict[str, Any]) -> None:
         stage = entry["stage"]
         pending = entry["pending"]
         poll_count = int(pending.get("poll_count", 0) or 0) + 1
+        polled_at = utcnow()
         self.update_document(
             entry["document_id"],
             {
                 "$set": {
-                    f"scans.{stage}_pending.last_polled_at": utcnow(),
+                    f"scans.{stage}_pending.last_polled_at": polled_at,
                     f"scans.{stage}_pending.poll_count": poll_count,
-                    "scans.last_updated_at": utcnow(),
+                    f"scans.{stage}_pending.next_poll_due_at": self.calculate_next_pending_poll_at(
+                        poll_count=poll_count,
+                        now=polled_at,
+                    ),
+                    "scans.last_updated_at": polled_at,
                 }
             },
         )
 
-    def finalize_pending_virustotal_result(
+    def mark_pending_virustotal_retry(
+        self,
+        entry: dict[str, Any],
+        *,
+        error: str,
+        cooldown_seconds: int | None = None,
+    ) -> None:
+        stage = entry["stage"]
+        if stage == "T7":
+            self.ignore_t7_scan(
+                entry["document_id"],
+                reason=error,
+            )
+            return
+        pending = entry["pending"]
+        poll_count = int(pending.get("poll_count", 0) or 0) + 1
+        polled_at = utcnow()
+        delay_seconds = (
+            cooldown_seconds
+            if cooldown_seconds is not None
+            else self.vt_analysis_retry_cooldown_seconds
+        )
+        next_poll_due_at = max(
+            self.calculate_next_pending_poll_at(
+                poll_count=poll_count,
+                now=polled_at,
+            ),
+            polled_at + timedelta(seconds=delay_seconds),
+        )
+        self.update_document(
+            entry["document_id"],
+            {
+                "$set": {
+                    f"scans.{stage}_pending.last_polled_at": polled_at,
+                    f"scans.{stage}_pending.poll_count": poll_count,
+                    f"scans.{stage}_pending.next_poll_due_at": next_poll_due_at,
+                    f"scans.{stage}_pending.last_error": error[:500],
+                    "scans.last_updated_at": polled_at,
+                }
+            },
+        )
+
+    def calculate_next_pending_poll_at(
+        self,
+        *,
+        poll_count: int,
+        now: datetime,
+    ) -> datetime:
+        delay_seconds = self.vt_batch_poll_interval_seconds * (
+            self.vt_pending_backoff_multiplier ** max(poll_count - 1, 0)
+        )
+        delay_seconds = max(delay_seconds, self.vt_batch_poll_interval_seconds)
+        delay_seconds = min(delay_seconds, self.vt_pending_max_poll_interval_seconds)
+        return now + timedelta(seconds=delay_seconds)
+
+    def collect_completed_vt_analysis_futures(self) -> int:
+        completed_count = 0
+        for future in list(self.vt_analysis_futures):
+            if not future.done():
+                continue
+            entry = self.vt_analysis_futures.pop(future)
+            completed_count += 1
+            analysis_id = entry["pending"]["analysis_id"]
+            try:
+                analysis = future.result()
+            except Exception:
+                logging.exception(
+                    "Failed to collect VirusTotal analysis %s for %s",
+                    analysis_id,
+                    entry["url"],
+                )
+                self.mark_pending_virustotal_retry(
+                    entry,
+                    error=f"analysis_fetch_failed:{analysis_id}",
+                )
+                continue
+
+            status = analysis.get("data", {}).get("attributes", {}).get("status")
+            if status == "completed":
+                self.finalize_scan_after_vt(entry, analysis)
+            else:
+                self.mark_pending_virustotal_polled(entry)
+        return completed_count
+
+    def finalize_scan_after_vt(
         self, entry: dict[str, Any], analysis: dict[str, Any]
     ) -> None:
         stage = entry["stage"]
         pending = entry["pending"]
         vt_result = self.build_virustotal_result(pending=pending, analysis=analysis)
-        scan = self.build_scan_snapshot(
-            url=entry["url"],
-            started_at=entry["submitted_at"],
-            vt=vt_result,
+        partial_scan = {
+            "requested_url": entry["url"],
+            "started_at": entry["submitted_at"],
+            "completed_at": utcnow(),
+            "virustotal": vt_result,
+        }
+        self.reconcile_stage_scan(
+            entry["document_id"],
+            stage,
+            partial_scan,
+            unset_paths=self.vt_pending_clear_paths(stage),
         )
 
-        if stage == "T0":
-            scan["next_scan_due_at"] = scan["completed_at"] + timedelta(days=self.t7_days)
-        else:
-            baseline = entry["document"].get("scans", {}).get("T0") or {}
-            change_detection = self.evaluate_significant_change(baseline, scan)
-            scan["change_detection"] = change_detection
-            if change_detection["significant"]:
-                scan["scrape"] = self.scrape_url(
-                    url=entry["url"],
-                    reason=", ".join(change_detection["reasons"]),
+    def vt_pending_clear_paths(self, stage: str) -> list[str]:
+        return [
+            f"scans.{stage}_pending",
+            f"scans.{stage}_submit_retry_at",
+            f"scans.{stage}_last_submit_error",
+        ]
+
+    def gsb_pending_clear_paths(self, stage: str) -> list[str]:
+        return [
+            f"scans.{stage}_gsb_pending",
+            f"scans.{stage}_gsb_retry_at",
+            f"scans.{stage}_last_gsb_error",
+        ]
+
+    def collect_completed_scrape_futures(self) -> int:
+        completed_count = 0
+        for future in list(self.scrape_futures):
+            if not future.done():
+                continue
+            meta = self.scrape_futures.pop(future)
+            completed_count += 1
+            stage = meta["stage"]
+            try:
+                scrape = future.result()
+            except Exception as exc:
+                logging.exception(
+                    "Scrape worker failed for document %s stage %s",
+                    meta["document_id"],
+                    stage,
                 )
-            else:
-                scan["scrape"] = {
-                    "triggered": False,
-                    "status": "skipped",
-                    "reason": "no_significant_change",
-                    "reasons": change_detection["reasons"],
+                scrape = {
+                    "triggered": True,
+                    "status": "error",
+                    "reason": "scrape_worker_failed",
+                    "error": repr(exc),
                     "checked_at": utcnow(),
                 }
 
-        self.write_scan(entry["document_id"], stage, scan, clear_pending=True)
+            self.reconcile_stage_scan(
+                meta["document_id"],
+                stage,
+                {"scrape": scrape},
+                allow_scrape_queue=False,
+            )
+            if stage == "T7" and scrape.get("status") == "error":
+                self.ignore_t7_scan(
+                    meta["document_id"],
+                    reason=(scrape.get("error") or scrape.get("reason") or "scrape_failed"),
+                )
+        return completed_count
 
     def process_due_t7(self) -> bool:
         return bool(self.find_due_t7_candidates(1))
@@ -724,7 +1482,7 @@ class VTScannerService:
         stage: str,
         scan: dict[str, Any],
         *,
-        clear_pending: bool = False,
+        unset_paths: list[str] | None = None,
     ) -> None:
         update = {
             "$set": {
@@ -732,8 +1490,8 @@ class VTScannerService:
                 "scans.last_updated_at": utcnow(),
             }
         }
-        if clear_pending:
-            update["$unset"] = {f"scans.{stage}_pending": ""}
+        if unset_paths:
+            update["$unset"] = {path: "" for path in unset_paths}
         try:
             self.update_document(document_id, update)
         except (DocumentTooLarge, OperationFailure) as exc:
@@ -747,6 +1505,127 @@ class VTScannerService:
             compact_scan = self.compact_scan_payload(scan)
             update["$set"][f"scans.{stage}"] = compact_scan
             self.update_document(document_id, update)
+
+    def merge_scan_payload(
+        self, existing: dict[str, Any], partial: dict[str, Any]
+    ) -> dict[str, Any]:
+        merged = dict(existing)
+        for key, value in partial.items():
+            if key == "requested_url":
+                merged[key] = merged.get(key) or value
+            elif key in {"started_at", "completed_at"}:
+                current = merged.get(key)
+                if isinstance(current, datetime) and isinstance(value, datetime):
+                    merged[key] = min(current, value)
+                else:
+                    merged[key] = current or value
+            elif key == "next_scan_due_at":
+                merged[key] = merged.get(key) or value
+            else:
+                merged[key] = value
+        return merged
+
+    def ignore_t7_scan(self, document_id: Any, *, reason: str) -> None:
+        ignored_at = utcnow()
+        self.collection.update_one(
+            {"_id": document_id},
+            {
+                "$set": {
+                    "scans.T7.ignored": True,
+                    "scans.T7.ignored_at": ignored_at,
+                    "scans.T7.ignored_reason": reason[:500],
+                    "scans.last_updated_at": ignored_at,
+                },
+                "$unset": {
+                    "scans.T7_queue": "",
+                    "scans.T7_pending": "",
+                    "scans.T7_submit_retry_at": "",
+                    "scans.T7_last_submit_error": "",
+                    "scans.T7_gsb_pending": "",
+                    "scans.T7_gsb_retry_at": "",
+                    "scans.T7_last_gsb_error": "",
+                },
+            },
+        )
+
+    def reconcile_stage_scan(
+        self,
+        document_id: Any,
+        stage: str,
+        partial_scan: dict[str, Any],
+        *,
+        unset_paths: list[str] | None = None,
+        allow_scrape_queue: bool = True,
+    ) -> dict[str, Any]:
+        doc = self.collection.find_one(
+            {"_id": document_id},
+            {
+                "task.url": 1,
+                "scans.T0": 1,
+                f"scans.{stage}": 1,
+            },
+        )
+        if not doc:
+            raise RuntimeError(f"Document {document_id!r} disappeared during scan reconciliation.")
+
+        scans = doc.get("scans") or {}
+        existing = scans.get(stage)
+        if not isinstance(existing, dict):
+            existing = {}
+
+        merged = self.merge_scan_payload(existing, partial_scan)
+        merged["requested_url"] = merged.get("requested_url") or doc.get("task", {}).get("url")
+
+        if stage == "T0":
+            completed_at = merged.get("completed_at")
+            if isinstance(completed_at, datetime) and "next_scan_due_at" not in merged:
+                merged["next_scan_due_at"] = completed_at + timedelta(days=self.t7_days)
+        else:
+            baseline = (scans.get("T0") or {}) if isinstance(scans.get("T0"), dict) else {}
+            change_detection = self.evaluate_significant_change(baseline, merged)
+            merged["change_detection"] = change_detection
+            if change_detection["significant"]:
+                if allow_scrape_queue and not self.has_successful_scrape(merged):
+                    self.queue_scrape_work(
+                        document_id=document_id,
+                        stage=stage,
+                        url=merged.get("requested_url") or doc.get("task", {}).get("url"),
+                        reason=", ".join(change_detection["reasons"]),
+                    )
+            elif "scrape" not in merged:
+                merged["scrape"] = {
+                    "triggered": False,
+                    "status": "skipped",
+                    "reason": "no_significant_change",
+                    "reasons": change_detection["reasons"],
+                    "checked_at": utcnow(),
+                }
+
+        self.write_scan(document_id, stage, merged, unset_paths=unset_paths)
+        return merged
+
+    def queue_scrape_work(
+        self,
+        *,
+        document_id: Any,
+        stage: str,
+        url: str,
+        reason: str,
+        previous_scrape: dict[str, Any] | None = None,
+    ) -> bool:
+        if not url or self.has_inflight_scrape(document_id, stage):
+            return False
+        future = self.scrape_executor.submit(
+            self.scrape_url,
+            url=url,
+            reason=reason,
+            previous_scrape=previous_scrape,
+        )
+        self.scrape_futures[future] = {
+            "document_id": document_id,
+            "stage": stage,
+        }
+        return True
 
     def update_document(self, document_id: Any, update: dict[str, Any]) -> None:
         result = self.collection.update_one({"_id": document_id}, update)
@@ -793,19 +1672,6 @@ class VTScannerService:
         if scrape.get("error"):
             compact["error"] = scrape["error"]
         return compact
-
-    def build_scan_snapshot(
-        self, *, url: str, started_at: datetime, vt: dict[str, Any]
-    ) -> dict[str, Any]:
-        gsb = self.check_google_safe_browsing(url)
-        completed_at = utcnow()
-        return {
-            "requested_url": url,
-            "started_at": started_at,
-            "completed_at": completed_at,
-            "virustotal": vt,
-            "google_safe_browsing": gsb,
-        }
 
     def submit_virustotal_scan(self, url: str) -> dict[str, Any]:
         submitted_at = utcnow()
@@ -854,6 +1720,51 @@ class VTScannerService:
     def fetch_virustotal_analysis(self, analysis_id: str) -> dict[str, Any]:
         return self.virustotal_request("GET", f"/analyses/{analysis_id}")
 
+    def record_vt_request(self, method: str, path: str, status_code: int) -> None:
+        current_day = utcnow().date().isoformat()
+        stats = self.vt_request_stats
+        if stats.day != current_day:
+            logging.info(
+                "VT daily summary day=%s total=%s submit=%s analyses=%s other=%s success=%s quota_429=%s",
+                stats.day,
+                stats.total_requests,
+                stats.submit_requests,
+                stats.analysis_requests,
+                stats.other_requests,
+                stats.successful_requests,
+                stats.quota_429s,
+            )
+            stats = VTRequestStats(day=current_day)
+            self.vt_request_stats = stats
+
+        stats.total_requests += 1
+        if method == "POST" and path == "/urls":
+            stats.submit_requests += 1
+        elif method == "GET" and path.startswith("/analyses/"):
+            stats.analysis_requests += 1
+        else:
+            stats.other_requests += 1
+
+        if 200 <= status_code < 300:
+            stats.successful_requests += 1
+        if status_code == 429:
+            stats.quota_429s += 1
+
+        if stats.total_requests % 25 == 0 or status_code == 429:
+            logging.info(
+                "VT usage day=%s total=%s submit=%s analyses=%s other=%s success=%s quota_429=%s last=%s %s status=%s",
+                stats.day,
+                stats.total_requests,
+                stats.submit_requests,
+                stats.analysis_requests,
+                stats.other_requests,
+                stats.successful_requests,
+                stats.quota_429s,
+                method,
+                path,
+                status_code,
+            )
+
     def virustotal_request(
         self,
         method: str,
@@ -864,8 +1775,11 @@ class VTScannerService:
     ) -> Any:
         expected_statuses = expected_statuses or {200}
         last_error: Exception | None = None
-        for attempt in range(6):
-            key = self.vt_pool.acquire()
+        max_attempts = 1 if path.startswith("/analyses/") else 3
+        for attempt in range(max_attempts):
+            if not self.vt_disable_throttle:
+                self.vt_key.wait()
+            key = self.vt_key
             headers = dict(kwargs.pop("headers", {}))
             headers["x-apikey"] = key.api_key
             try:
@@ -888,18 +1802,28 @@ class VTScannerService:
                 time.sleep(sleep_for)
                 continue
 
+            self.record_vt_request(method, path, response.status_code)
+
             if response.status_code in expected_statuses:
                 return safe_json(response)
 
             payload = safe_json(response)
             if is_retryable_status(response.status_code):
                 if response.status_code == 429:
-                    cooldown_seconds = parse_retry_after_seconds(
-                        response.headers.get("Retry-After"),
-                        float(self.vt_rate_limit_cooldown_seconds),
+                    if not self.vt_disable_throttle:
+                        cooldown_seconds = parse_retry_after_seconds(
+                            response.headers.get("Retry-After"),
+                            float(self.vt_rate_limit_cooldown_seconds),
+                        )
+                        self.vt_key.mark_rate_limited(cooldown_seconds)
+                        logging.warning(
+                            "Cooling down VirusTotal key %s for %.1fs after rate limit response",
+                            key.fingerprint,
+                            cooldown_seconds,
+                        )
+                    raise RetryableError(
+                        f"VirusTotal quota exceeded for {method} {path} using key {key.fingerprint}"
                     )
-                    self.vt_pool.mark_rate_limited(key, cooldown_seconds)
-                    sleep_for = cooldown_seconds
                 else:
                     sleep_for = min(2**attempt, 60)
                 logging.warning(
@@ -921,6 +1845,13 @@ class VTScannerService:
         raise RetryableError(f"VirusTotal request {method} {path} failed repeatedly: {last_error}")
 
     def check_google_safe_browsing(self, url: str) -> dict[str, Any]:
+        now = utcnow()
+        if now < self.gsb_rate_limit_until:
+            remaining = (self.gsb_rate_limit_until - now).total_seconds()
+            raise RateLimitError(
+                f"Google Safe Browsing cooldown active for {url}",
+                cooldown_seconds=remaining,
+            )
         payload = {
             "client": {"clientId": "vt-scanner", "clientVersion": "1.0"},
             "threatInfo": {
@@ -938,7 +1869,7 @@ class VTScannerService:
 
         for attempt in range(6):
             try:
-                response = self.session.post(
+                response = self.gsb_session.post(
                     GSB_FIND_URL,
                     params={"key": self.gsb_api_key},
                     json=payload,
@@ -979,6 +1910,12 @@ class VTScannerService:
                     "checked_at": utcnow(),
                     "error": None,
                 }
+
+            if response.status_code == 429:
+                raise RateLimitError(
+                    f"Google Safe Browsing rate limited for {url}",
+                    cooldown_seconds=12 * 60 * 60,
+                )
 
             if is_retryable_status(response.status_code):
                 sleep_for = min(2**attempt, 60)
@@ -1237,6 +2174,12 @@ class VTScannerService:
             "screenshot": live_item.get("screenshot"),
             "urlscanresults": urlscanresults,
             "urlscanresults_updated_at": utcnow(),
+            "scans": {
+                "T0_queue": {
+                    "queued_at": utcnow(),
+                    "source": "urlscan_live_feed",
+                }
+            },
         }
         if dom_payload is not None:
             document["dom"] = dom_payload
